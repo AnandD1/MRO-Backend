@@ -1,0 +1,7 @@
+aiortc==1.6.0
+aiohttp==3.9.1
+opencv-python==4.8.1.78
+numpy==1.24.3
+aiohttp-cors==0.7.0
+websockets==11.0.3
+Pillow==10.1.0
