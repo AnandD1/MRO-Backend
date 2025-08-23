@@ -1,4 +1,3 @@
-# Use Python 3.11 slim image as base
 FROM python:3.11-slim
 
 # Set working directory
@@ -14,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     libgthread-2.0-0 \
     libfontconfig1 \
     libgtk-3-0 \
-    libgl1-mesa-glx \
+    libgl1 \
     libgstreamer1.0-0 \
     libgstreamer-plugins-base1.0-0 \
     libavcodec-dev \
