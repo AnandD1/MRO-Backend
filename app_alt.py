@@ -15,18 +15,12 @@ import json
 from ultralytics import YOLO
 
 
-
-
 app = Flask(__name__)
-
-
 
 
 # Configure logging - temporarily enable werkzeug for debugging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
 
 
 # Disable all logging for maximum performance
@@ -36,13 +30,9 @@ app.logger.disabled = True
 logging.getLogger().setLevel(logging.ERROR)
 
 
-
-
 # Create directories only for non-frame data if needed
 os.makedirs('received_images/color', exist_ok=True)
 os.makedirs('received_images/depth', exist_ok=True)
-
-
 
 
 # Store latest images for web display
@@ -57,17 +47,11 @@ unity_frames_received = 0
 start_time = datetime.now()
 
 
-
-
 # Add global variables for tracking selected frames
-latest_unity_frame = None
-latest_unity_timestamp = None
 latest_selected_frame = None  # Store the selected 1-out-of-3 frames
 latest_selected_timestamp = None  # Timestamp for selected frames
 frame_counter = 0  # Counter to track frame selection
 selected_frames_count = 0  # Counter for selected frames
-
-
 
 
 # Add new global variables for AI processing
@@ -75,8 +59,7 @@ latest_ai_processed_frame = None  # Store the frame with AI detections
 latest_ai_timestamp = None  # Timestamp for AI processed frames
 ai_processed_count = 0  # Counter for AI processed frames
 ai_model = None  # YOLOv8 model instance
-
-
+latest_ai_detection_count = 0  # <- add: track number of detections for last AI frame
 
 
 # Load YOLOv8 model at startup
@@ -94,52 +77,57 @@ def load_yolo_model():
         return False
 
 
+# Concurrency primitives
+frame_lock = threading.Lock()
+
+# Frame selection ratio: process 1 in every N frames
+FRAME_SELECTION_RATIO = 3
 
 
 # Function to run inference on an image
-def process_frame_with_ai(frame, timestamp_ms=None, websocket=None):
+def process_frame_with_ai(frame, timestamp_ms=None):
     """Process the frame with YOLOv8 and return annotated image"""
     global ai_model, ai_processed_count
-   
+    
     if ai_model is None:
         return frame, []  # Return original frame if model not loaded
-   
+    
     try:
         # Run YOLOv8 inference
         results = ai_model.predict(frame, conf=0.25)  # Adjust confidence threshold as needed
-       
+        
         # Get the first result (only one image)
         result = results[0]
-       
+        
         # Create a copy of the frame to draw on
         annotated_frame = frame.copy()
-       
+        
         # Prepare detections list
         detections = []
         unity_detections = []
-       
+        
         # Draw bounding boxes and labels on the frame
         if result.boxes is not None and len(result.boxes) > 0:
             boxes = result.boxes.xyxy.cpu().numpy()
             confidences = result.boxes.conf.cpu().numpy()
             class_ids = result.boxes.cls.cpu().numpy().astype(int)
-           
+            
             # Get class names
             class_names = result.names
-           
+            
             # Process each detection
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = map(int, box)
                 conf = confidences[i]
                 cls_id = class_ids[i]
                 cls_name = class_names.get(cls_id, f"Class {cls_id}")
-               
+                
                 # Calculate Unity-required values
                 center_x = (x1 + x2) / 2
                 center_y = (y1 + y2) / 2
                 width = abs(x2 - x1)
                 height = abs(y2 - y1)
-               
+                
                 # Add detection info to list for backend use
                 detections.append({
                     "class": cls_name,
@@ -148,173 +136,142 @@ def process_frame_with_ai(frame, timestamp_ms=None, websocket=None):
                     "center": [center_x, center_y],
                     "size": [width, height]
                 })
-               
-                # Add to Unity-formatted detection list
-                unity_detections.append({
-                    "time": timestamp_ms,
-                    "xScreen": center_x,
-                    "yScreen": center_y,
-                    "width": width,
-                    "height": height,
-                    "class": cls_name,
-                    "confidence": float(conf)
-                })
-               
-                # Draw rectangle and label
+                
+                # Draw rectangle and label on the frame
                 color = (0, 255, 0)  # Green box
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-               
+                
                 # Add label with class name and confidence
                 label = f"{cls_name}: {conf:.2f}"
-                cv2.putText(annotated_frame, label, (x1, y1 - 10),
+                cv2.putText(annotated_frame, label, (x1, y1 - 10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-       
-        # Send detections to Unity if websocket is provided and we have detections
-        if websocket is not None and len(unity_detections) > 0:
-            asyncio.create_task(send_detections_to_unity(websocket, unity_detections))
-       
+        
         ai_processed_count += 1
         return annotated_frame, detections
-   
+    
     except Exception as e:
         logger.error(f"Error in AI processing: {e}")
         return frame, []  # Return original frame on error
 
 
-
-
-# Add function to send detections back to Unity
-async def send_detections_to_unity(websocket, detections):
-    """Send detection data back to Unity via WebSocket with frame dims"""
+# Helper to build binary frame packet: [8 bytes little-endian timestamp][JPEG bytes]
+def build_frame_packet(frame, timestamp_ms, quality=75):
+    """Build a binary packet for frame transmission: [timestamp][JPEG data]"""
     try:
-        # Normalize per‑detection timestamp
-        for d in detections:
-            if "time" in d and d["time"] is not None:
-                d["time"] = int(d["time"])
-        # Get AI frame dimensions from the latest selected frame
-        global latest_selected_frame
-        if latest_selected_frame is not None:
-            ai_h, ai_w = latest_selected_frame.shape[:2]
-        else:
-            ai_h, ai_w = 0, 0  # Unity will ignore zero sizes
-
-
-        # Inline message construction
-        message = {
-            "type": "detections",
-            "count": len(detections),
-            "detections": detections,
-            "timestamp": int(datetime.now().timestamp() * 1000),  # server send time (ms)
-            "aiWidth": ai_w,
-            "aiHeight": ai_h,
-            "aiYOriginTopLeft": True
-        }
-
-
-        await websocket.send(json.dumps(message))
-
-
-        # Logging
-        if detections:
-            logger.info(f"Sent {len(detections)} detections to Unity client (ai {ai_w}x{ai_h})")
-            logger.info(
-                f"Sample detection center=({detections[0]['xScreen']:.1f},{detections[0]['yScreen']:.1f}) "
-                f"w={detections[0]['width']:.1f} h={detections[0]['height']:.1f} cls={detections[0].get('class','?')}"
-            )
-        else:
-            logger.info(f"Sent empty detections set (ai {ai_w}x{ai_h})")
-
-
+        encode_params = [
+            cv2.IMWRITE_JPEG_QUALITY, int(quality),
+            cv2.IMWRITE_JPEG_OPTIMIZE, 0,
+            cv2.IMWRITE_JPEG_PROGRESSIVE, 0
+        ]
+        ok, buffer = cv2.imencode('.jpg', frame, encode_params)
+        if not ok:
+            return None
+        header = int(timestamp_ms).to_bytes(8, byteorder='little', signed=False)
+        return header + buffer.tobytes()
     except Exception as e:
-        logger.error(f"Error sending detections to Unity: {e}")
-
-
+        logger.error(f"Error building frame packet: {e}")
+        return None
 
 
 # Simple WebSocket handler - treat all connections as Unity clients for simplicity
 # Modify the unity_websocket_handler function in your backend
-
-
 async def unity_websocket_handler(websocket):
     """Handle Unity WebSocket connections with frame selection logic"""
     global websocket_clients, unity_frames_received, latest_unity_frame, latest_unity_timestamp
     global frame_counter, latest_selected_frame, latest_selected_timestamp, selected_frames_count
-    global latest_ai_processed_frame, latest_ai_timestamp
+    global latest_ai_processed_frame, latest_ai_timestamp, latest_ai_detection_count
    
     websocket_clients += 1
    
+    async def run_ai_and_send(image, timestamp_ms, ws):
+        """Run AI in a threadpool and send annotated frame packet back over websocket when done."""
+        global latest_ai_processed_frame, latest_ai_timestamp, latest_ai_detection_count, ai_processed_count
+        try:
+            # Run CPU/GPU bound inference in executor to avoid blocking event loop
+            loop = asyncio.get_running_loop()
+            annotated, detections = await loop.run_in_executor(None, process_frame_with_ai, image, timestamp_ms)
+
+            # Update shared state under lock
+            with frame_lock:
+                latest_ai_processed_frame = annotated
+                latest_ai_timestamp = datetime.fromtimestamp(timestamp_ms / 1000.0).isoformat()
+                latest_ai_detection_count = len(detections)
+                ai_processed_count += 1
+
+            # Build and send binary packet containing only [timestamp][JPEG]
+            packet = build_frame_packet(annotated, timestamp_ms, quality=85)
+            if packet is not None:
+                try:
+                    await ws.send(packet)
+                except Exception:
+                    # If send fails, ignore to keep main loop healthy
+                    logger.debug("Failed to send annotated packet to client")
+        except Exception as e:
+            logger.error(f"AI worker error: {e}")
+
     try:
         # Main frame receiving loop
         while True:
             try:
-                # Receive data from Unity
                 frame_data = await websocket.recv()
-               
-                # Handle binary frame data (JPEG from Unity)
-                if isinstance(frame_data, bytes) and len(frame_data) > 16:  # Ensure we have enough data
-                    # Extract timestamp (first 8 bytes)
+
+                # Binary frames
+                if isinstance(frame_data, (bytes, bytearray)) and len(frame_data) > 16:
                     timestamp_bytes = frame_data[:8]
-                    image_data = frame_data[8:]  # Rest is the JPEG data
-                   
-                    # Convert timestamp bytes to long/int64 (milliseconds since epoch)
+                    image_data = frame_data[8:]
                     timestamp_ms = int.from_bytes(timestamp_bytes, byteorder='little')
-                   
-                    # Convert to datetime
                     timestamp = datetime.fromtimestamp(timestamp_ms / 1000.0)
-                   
-                    # Decode frame
+
+                    # Decode image quickly
                     nparr = np.frombuffer(image_data, np.uint8)
                     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                   
-                    if image is not None:
-                        # Store latest frame for main display
+                    if image is None:
+                        continue
+
+                    # Immediately echo original image back (non-blocking)
+                    packet = build_frame_packet(image, timestamp_ms, quality=70)
+                    if packet is not None:
+                        try:
+                            await websocket.send(packet)
+                        except Exception:
+                            logger.debug("Failed to send echo packet")
+
+                    # Update shared state for display endpoints
+                    with frame_lock:
                         latest_unity_frame = image
                         latest_unity_timestamp = timestamp.isoformat()
                         unity_frames_received += 1
-                       
-                        # Frame selection logic (1 out of 3)
+
+                        # Selection and scheduling AI on 1-in-N frames
                         frame_counter += 1
-                        if frame_counter % 3 == 0:
-                            # Store selected frame (make a copy to avoid reference issues)
+                        if frame_counter % FRAME_SELECTION_RATIO == 0:
                             latest_selected_frame = image.copy()
                             latest_selected_timestamp = timestamp.isoformat()
                             selected_frames_count += 1
-                           
-                            # Process the selected frame with AI model and pass websocket for response
-                            if ai_model is not None:
-                                processed_frame, detections = process_frame_with_ai(
-                                    latest_selected_frame,
-                                    timestamp_ms,
-                                    websocket
-                                )
-                                latest_ai_processed_frame = processed_frame
-                                latest_ai_timestamp = timestamp.isoformat()
-                               
-                                # Log occasionally (every 10 frames)
-                                if selected_frames_count % 10 == 0:
-                                    logger.info(f"AI processed frame #{selected_frames_count}, "
-                                                f"timestamp: {timestamp}, detections: {len(detections)}")
-                           
-                # Handle text messages (possibly commands from Unity)
+
+                            # Schedule AI in background (no await)
+                            asyncio.create_task(run_ai_and_send(latest_selected_frame, timestamp_ms, websocket))
+
+                # Text messages
                 elif isinstance(frame_data, str):
                     try:
                         message = json.loads(frame_data)
-                        # Handle command messages if needed
                         if 'command' in message:
                             logger.info(f"Received command from Unity: {message['command']}")
-                            # Handle different commands here
                     except json.JSONDecodeError:
-                        logger.warning(f"Received invalid JSON message: {frame_data[:100]}")
-                   
+                        logger.warning("Received invalid JSON message")
+
             except Exception as e:
-                # Log the error but continue processing
                 logger.error(f"Error processing frame: {e}")
+                # small sleep to avoid busy loop on repeated error
+                await asyncio.sleep(0.001)
                 continue
-               
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}")
     finally:
         websocket_clients -= 1
+
+
 # Start WebSocket server - optimized settings
 def start_websocket_server():
     """Start optimized WebSocket server for minimal latency"""
@@ -346,8 +303,6 @@ def start_websocket_server():
     thread = threading.Thread(target=run_in_thread, daemon=True)
     thread.start()
     return thread
-
-
 
 
 # Flask routes
@@ -476,7 +431,7 @@ def index():
                     <div>Client FPS: <span id="fps">0</span></div>
                 </div>
             </div>
-           
+            
             <!-- Selected stream (1 of 3 frames) -->
             <div class="selected-container">
                 <div class="stream-title">
@@ -492,7 +447,7 @@ def index():
                     <div>Last Selected: <span id="last-selected-time">-</span></div>
                 </div>
             </div>
-           
+            
             <!-- AI processed stream -->
             <div class="ai-container">
                 <div class="stream-title">
@@ -650,53 +605,52 @@ def index():
                         .catch(() => {});
                 }
             }
-           
+            
             // Update AI stream
-           // In the script section of your HTML template, modify the updateAiStream function:
-function updateAiStream() {
-    const now = performance.now();
-    aiStream.src = '/ai_processed_frame?' + now + Math.random().toString(36).slice(2);
-    aiFramesReceived++;
-   
-    // Calculate FPS for AI stream
-    if (aiFramesReceived % 5 === 0) {
-        const elapsed = now - lastAiTime;
-        aiFpsValue = Math.round(5 * 1000 / (elapsed + 0.1));
-        aiFpsEl.textContent = aiFpsValue + " FPS";
-        lastAiTime = now;
-       
-        // Update indicator color
-        if (aiFpsValue > 5) {
-            aiIndicator.style.backgroundColor = "#0f0"; // Green
-        } else if (aiFpsValue > 2) {
-            aiIndicator.style.backgroundColor = "#ff0"; // Yellow
-        } else {
-            aiIndicator.style.backgroundColor = "#f00"; // Red
-        }
-       
-        // Fetch AI info
-        fetch('/debug?' + Date.now())
-            .then(r => r.json())
-            .then(d => {
-                if (d.latest_ai_timestamp) {
-                    lastAiTimeEl.textContent =
-                        formatTimeDiff(d.latest_ai_timestamp);
-                   
-                    // Add Unity timestamp to the AI info display
-                    aiInfoEl.textContent =
-                        `YOLOv8: ${d.ai_detection_count || 0} objects | Unity timestamp: ${d.unity_timestamp_readable || "unknown"}`;
+            function updateAiStream() {
+                const now = performance.now();
+                aiStream.src = '/ai_processed_frame?' + now + Math.random().toString(36).slice(2);
+                aiFramesReceived++;
+                
+                // Calculate FPS for AI stream
+                if (aiFramesReceived % 5 === 0) {
+                    const elapsed = now - lastAiTime;
+                    aiFpsValue = Math.round(5 * 1000 / (elapsed + 0.1));
+                    aiFpsEl.textContent = aiFpsValue + " FPS";
+                    lastAiTime = now;
+                    
+                    // Update indicator color
+                    if (aiFpsValue > 5) {
+                        aiIndicator.style.backgroundColor = "#0f0"; // Green
+                    } else if (aiFpsValue > 2) {
+                        aiIndicator.style.backgroundColor = "#ff0"; // Yellow
+                    } else {
+                        aiIndicator.style.backgroundColor = "#f00"; // Red
+                    }
+                    
+                    // Fetch AI info
+                    fetch('/debug?' + Date.now())
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.latest_ai_timestamp) {
+                                lastAiTimeEl.textContent = 
+                                    formatTimeDiff(d.latest_ai_timestamp);
+                                
+                                // Add Unity timestamp to the AI info display
+                                aiInfoEl.textContent = 
+                                    `YOLOv8: ${d.ai_detection_count || 0} objects | Unity timestamp: ${d.unity_timestamp_readable || "unknown"}`;
+                            }
+                        })
+                        .catch(() => {});
                 }
-            })
-            .catch(() => {});
             }
-        }
-               
+                    
             // Start streams
             requestAnimationFrame(updateMainStream);
            
             // Update selected stream at ~10fps
             setInterval(updateSelectedStream, 100);
-           
+            
             // Update AI stream at ~10fps
             setInterval(updateAiStream, 100);
            
@@ -712,8 +666,6 @@ function updateAiStream() {
     </html>
     '''
     return render_template_string(html_template)
-
-
 
 
 @app.route('/latest_unity_frame')
@@ -737,8 +689,6 @@ def latest_unity_frame_route():
         return "", 404
 
 
-
-
 # Add endpoint to serve selected frames
 @app.route('/selected_frame')
 def selected_frame_route():
@@ -758,8 +708,6 @@ def selected_frame_route():
         return response
     else:
         return "", 404
-
-
 
 
 # Add endpoint to serve AI-processed frames
@@ -783,8 +731,6 @@ def ai_processed_frame_route():
         return "", 404
 
 
-
-
 # Remove all other routes except essential ones
 @app.route('/api/status')
 def api_status():
@@ -795,7 +741,6 @@ def api_status():
         'ai_processed': ai_processed_count,
         'frame_resolution': latest_unity_frame.shape if latest_unity_frame is not None else None
     })
-
 
 @app.route('/debug')
 def debug_info():
@@ -809,7 +754,7 @@ def debug_info():
             unity_timestamp_readable = dt.strftime("%H:%M:%S.%f")[:-3]
         except:
             unity_timestamp_readable = latest_unity_timestamp
-           
+            
     return jsonify({
         'websocket_clients': websocket_clients,
         'unity_frames_received': unity_frames_received,
@@ -826,9 +771,8 @@ def debug_info():
         'frame_shape': latest_unity_frame.shape if latest_unity_frame is not None else None,
         'server_time': datetime.now().isoformat(),
         'ai_model_loaded': ai_model is not None,
-        'ai_detection_count': len(latest_ai_processed_frame) if latest_ai_processed_frame is not None else 0
+        'ai_detection_count': latest_ai_detection_count  # <- fix: correct detection count
     })
-
 
 # Add a simple test image endpoint
 @app.route('/test_image')
@@ -855,15 +799,13 @@ def test_image():
     return response
 
 
-
-
 if __name__ == '__main__':
     try:
         # Load the YOLOv8 model first
         load_yolo_model()
-       
+        
         # Start WebSocket server first
-        ws_thread = start_websocket_server();
+        ws_thread = start_websocket_server()
        
         # Start Flask with maximum performance settings
         app.run(
@@ -878,10 +820,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Error starting server: {e}")
         exit(1)
-
-
-
-
-
-
-
