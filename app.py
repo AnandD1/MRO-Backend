@@ -1,4 +1,3 @@
-# app.py
 from flask import Flask, jsonify, render_template_string, send_file, Response, session
 import asyncio
 import websockets
@@ -14,7 +13,7 @@ from dotenv import load_dotenv
 
 # Add blueprint imports
 from auth_routes import bp_auth
-# from scan_routes import bp_scan  # Comment out - doesn't exist yet
+from scan_routes import bp_scan
 
 
 # ----------------------------
@@ -786,7 +785,7 @@ def api_status():
 
 # Register blueprints
 app.register_blueprint(bp_auth)
-# app.register_blueprint(bp_scan)  # Comment out - doesn't exist yet
+app.register_blueprint(bp_scan)
 
 # ----------------------------
 # Main

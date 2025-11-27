@@ -1,72 +1,121 @@
-from flask import Blueprint, jsonify, request
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from datetime import datetime
-from db import get_db
-from utils import json_required
-from bson import ObjectId
+from flask import Blueprint, jsonify, request, session
+import logging
+from db import ScanManager
+from utils import session_required
 
 bp_scan = Blueprint("scans", __name__, url_prefix="/api/scans")
 
-@bp_scan.post("/")
-@bp_scan.post("")   # allow no trailing slash
-@jwt_required()
+# Initialize scan manager
+scan_manager = ScanManager()
+
+logger = logging.getLogger(__name__)
+
+@bp_scan.route('/', methods=['POST'])
+@bp_scan.route('', methods=['POST'])
+@session_required
 def create_scan():
     """
-    Save a scan JSON posted by the headset or a tool.
-    Expect the body to match your 'Exported scan' schema.
-    Optional: scan_name string for easier listing.
-    """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"ok": False, "error": "invalid_json"}), 400
-
-    email = get_jwt_identity()
-    db = get_db()
-    user = db.users.find_one({"email": email}, {"_id": 1})
-    if not user:
-        return jsonify({"ok": False, "error": "user_not_found"}), 404
-
-    doc = {
-        "user_id": user["_id"],
-        "scan_name": request.args.get("name") or f"scan_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        "payload": data,  # store full JSON payload
-        "created_at": datetime.utcnow(),
+    Create a new scan from Unity client.
+    Expects JSON body matching the scan format:
+    {
+      "version": "1.0",
+      "ts_ms": <timestamp>,
+      "plane": { ... },
+      "markers": [ ... ]
     }
-    ins = db.scans.insert_one(doc)
-    return jsonify({"ok": True, "id": str(ins.inserted_id)}), 201
-
-@bp_scan.get("/")
-@jwt_required()
-def list_scans():
-    email = get_jwt_identity()
-    db = get_db()
-    user = db.users.find_one({"email": email}, {"_id": 1})
-    cur = db.scans.find({"user_id": user["_id"]}, {"payload": 0}).sort("created_at", -1)
-    out = []
-    for s in cur:
-        out.append({
-            "id": str(s["_id"]),
-            "scan_name": s.get("scan_name"),
-            "created_at": s.get("created_at").isoformat() + "Z"
-        })
-    return jsonify({"ok": True, "scans": out})
-
-@bp_scan.get("/<scan_id>")
-@jwt_required()
-def get_scan(scan_id):
-    email = get_jwt_identity()
-    db = get_db()
-    user = db.users.find_one({"email": email}, {"_id": 1})
+    Optional query parameter: ?name=custom_scan_name
+    """
     try:
-        _id = ObjectId(scan_id)
-    except Exception:
-        return jsonify({"ok": False, "error": "bad_id"}), 400
-    s = db.scans.find_one({"_id": _id, "user_id": user["_id"]})
-    if not s:
-        return jsonify({"ok": False, "error": "not_found"}), 404
-    return jsonify({"ok": True, "scan": {
-        "id": str(s["_id"]),
-        "scan_name": s.get("scan_name"),
-        "created_at": s.get("created_at").isoformat() + "Z",
-        "payload": s.get("payload"),
-    }})
+        data = request.get_json(silent=True)
+        
+        if not data:
+            return jsonify({"success": False, "message": "No JSON data provided"}), 400
+        
+        # Get user_id from session
+        user_id = session.get('user_id')
+        
+        # Get optional scan name from query params or request body
+        scan_name = request.args.get('name') or data.get('scan_name')
+        
+        # Create scan
+        result = scan_manager.create_scan(user_id, data, scan_name)
+        
+        if result["success"]:
+            logger.info(f"Scan created for user {user_id}: {result.get('scan_id')}")
+            return jsonify(result), 201
+        else:
+            return jsonify(result), 400
+            
+    except Exception as e:
+        logger.error(f"Error creating scan: {e}")
+        return jsonify({"success": False, "message": "Server error"}), 500
+
+@bp_scan.route('/', methods=['GET'])
+@bp_scan.route('', methods=['GET'])
+@session_required
+def list_scans():
+    """
+    List all scans globally (accessible to all authenticated users).
+    Optional query parameters:
+    - limit: number of scans to return (default: 100)
+    - skip: number of scans to skip for pagination (default: 0)
+    """
+    try:
+        # Get pagination parameters
+        limit = request.args.get('limit', 100, type=int)
+        skip = request.args.get('skip', 0, type=int)
+        
+        # Validate pagination
+        limit = min(max(1, limit), 500)  # Clamp between 1 and 500
+        skip = max(0, skip)
+        
+        # Get all scans (no user filtering)
+        result = scan_manager.get_all_scans(limit, skip)
+        
+        if result["success"]:
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 500
+            
+    except Exception as e:
+        logger.error(f"Error listing scans: {e}")
+        return jsonify({"success": False, "message": "Server error"}), 500
+
+@bp_scan.route('/<scan_id>', methods=['GET'])
+@session_required
+def get_scan(scan_id):
+    """
+    Get a specific scan by ID (globally accessible to all authenticated users).
+    """
+    try:
+        # Get scan without user filtering
+        result = scan_manager.get_scan_by_id(scan_id)
+        
+        if result["success"]:
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 404
+            
+    except Exception as e:
+        logger.error(f"Error getting scan: {e}")
+        return jsonify({"success": False, "message": "Server error"}), 500
+
+@bp_scan.route('/<scan_id>', methods=['DELETE'])
+@session_required
+def delete_scan(scan_id):
+    """
+    Delete a specific scan by ID (globally accessible - any authenticated user can delete).
+    """
+    try:
+        # Delete scan without user filtering
+        result = scan_manager.delete_scan(scan_id)
+        
+        if result["success"]:
+            logger.info(f"Scan {scan_id} deleted")
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 404
+            
+    except Exception as e:
+        logger.error(f"Error deleting scan: {e}")
+        return jsonify({"success": False, "message": "Server error"}), 500

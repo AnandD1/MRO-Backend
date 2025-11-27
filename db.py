@@ -116,3 +116,136 @@ class UserManager:
         except Exception as e:
             logger.error(f"Error getting user: {e}")
             return None
+
+# Scan management functions
+class ScanManager:
+    def __init__(self):
+        self.db = get_db()
+        self.scans = self.db.scans
+        
+    def create_scan(self, user_id, scan_data, scan_name=None):
+        """Create a new scan for a user"""
+        try:
+            from bson import ObjectId
+            
+            # Validate required fields in scan_data
+            if not scan_data.get("version"):
+                return {"success": False, "message": "Missing version field"}
+            if not scan_data.get("plane"):
+                return {"success": False, "message": "Missing plane data"}
+            if not scan_data.get("markers"):
+                return {"success": False, "message": "Missing markers array"}
+            
+            # Determine scan type based on markers
+            markers = scan_data.get("markers", [])
+            has_severity = any(m.get("severity") for m in markers)
+            scan_type = "manual" if has_severity else "ai"
+            
+            # Generate scan name if not provided
+            if not scan_name:
+                scan_name = f"scan_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Create scan document
+            scan_doc = {
+                "user_id": ObjectId(user_id),
+                "scan_name": scan_name,
+                "scan_type": scan_type,
+                "version": scan_data.get("version"),
+                "ts_ms": scan_data.get("ts_ms"),
+                "plane": scan_data.get("plane"),
+                "markers": markers,
+                "marker_count": len(markers),
+                "created_at": datetime.utcnow(),
+                "metadata": scan_data.get("metadata", {})
+            }
+            
+            # Insert scan
+            result = self.scans.insert_one(scan_doc)
+            
+            if result.inserted_id:
+                return {
+                    "success": True,
+                    "message": "Scan created successfully",
+                    "scan_id": str(result.inserted_id),
+                    "scan_type": scan_type,
+                    "marker_count": len(markers)
+                }
+            else:
+                return {"success": False, "message": "Failed to create scan"}
+                
+        except Exception as e:
+            logger.error(f"Error creating scan: {e}")
+            return {"success": False, "message": "Database error"}
+    
+    def get_all_scans(self, limit=100, skip=0):
+        """Get all scans (globally accessible) with pagination"""
+        try:
+            cursor = self.scans.find(
+                {},  # No user filter - get all scans
+                {"markers": 0}  # Exclude markers array for list view
+            ).sort("created_at", -1).skip(skip).limit(limit)
+            
+            scans = []
+            for scan in cursor:
+                scans.append({
+                    "id": str(scan["_id"]),
+                    "scan_name": scan.get("scan_name"),
+                    "scan_type": scan.get("scan_type"),
+                    "marker_count": scan.get("marker_count", 0),
+                    "created_at": scan.get("created_at").isoformat() + "Z" if scan.get("created_at") else None,
+                    "ts_ms": scan.get("ts_ms"),
+                    "created_by": str(scan.get("user_id"))  # Include creator info
+                })
+            
+            return {"success": True, "scans": scans, "count": len(scans)}
+            
+        except Exception as e:
+            logger.error(f"Error getting all scans: {e}")
+            return {"success": False, "message": "Database error"}
+    
+    def get_scan_by_id(self, scan_id):
+        """Get a specific scan by ID (globally accessible)"""
+        try:
+            from bson import ObjectId
+            
+            scan = self.scans.find_one({"_id": ObjectId(scan_id)})  # No user filter
+            
+            if not scan:
+                return {"success": False, "message": "Scan not found"}
+            
+            return {
+                "success": True,
+                "scan": {
+                    "id": str(scan["_id"]),
+                    "scan_name": scan.get("scan_name"),
+                    "scan_type": scan.get("scan_type"),
+                    "version": scan.get("version"),
+                    "ts_ms": scan.get("ts_ms"),
+                    "plane": scan.get("plane"),
+                    "markers": scan.get("markers", []),
+                    "marker_count": scan.get("marker_count", 0),
+                    "created_at": scan.get("created_at").isoformat() + "Z" if scan.get("created_at") else None,
+                    "created_by": str(scan.get("user_id")),  # Include creator info
+                    "metadata": scan.get("metadata", {})
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting scan: {e}")
+            return {"success": False, "message": "Database error"}
+    
+    def delete_scan(self, scan_id):
+        """Delete a scan (globally accessible - any authenticated user can delete)"""
+        try:
+            from bson import ObjectId
+            
+            result = self.scans.delete_one({"_id": ObjectId(scan_id)})  # No user filter
+            
+            if result.deleted_count > 0:
+                return {"success": True, "message": "Scan deleted successfully"}
+            else:
+                return {"success": False, "message": "Scan not found"}
+                
+        except Exception as e:
+            logger.error(f"Error deleting scan: {e}")
+            return {"success": False, "message": "Database error"}
